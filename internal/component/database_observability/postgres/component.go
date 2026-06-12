@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/lib/pq"
-	pg_collector "github.com/prometheus-community/postgres_exporter/collector"
-	pg_exporter "github.com/prometheus-community/postgres_exporter/exporter"
+	"github.com/prometheus-community/postgres_exporter/collectors"
+	upstream_config "github.com/prometheus-community/postgres_exporter/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
@@ -178,6 +178,33 @@ func (a *PrometheusExporterArguments) Validate() error {
 	return args.Validate()
 }
 
+func postgresExporterCollectorStates(disableSettingsMetrics bool, enabledCollectors []string) map[string]bool {
+	states := upstream_config.DefaultCollectorConfig()
+	if disableSettingsMetrics {
+		states[upstream_config.CollectorSettings] = false
+	}
+	for _, collectorName := range enabledCollectors {
+		states[collectorName] = true
+	}
+	return states
+}
+
+func postgresExporterStatStatementsConfig(flags *exporter_postgres.StatStatementFlags) upstream_config.PGStatStatementsConfig {
+	cfg := upstream_config.NewConfigWithDefaults().PGStatStatements
+	if flags != nil {
+		cfg.IncludeQuery = flags.IncludeQuery
+		if flags.QueryLength != 0 {
+			cfg.QueryLength = flags.QueryLength
+		}
+		if flags.Limit != 0 {
+			cfg.Limit = flags.Limit
+		}
+		cfg.ExcludeDatabases = flags.ExcludeDatabases
+		cfg.ExcludeUsers = flags.ExcludeUsers
+	}
+	return cfg
+}
+
 func (a *Arguments) SetToDefault() {
 	*a = defaultArguments()
 }
@@ -226,21 +253,29 @@ type Collector interface {
 	Stop()
 }
 
+// postgresExporterRuntime is the narrow part of upstream's runtime used here.
+// Keeping it as an interface lets tests use lightweight fakes without creating
+// a real postgres_exporter runtime.
+type postgresExporterRuntime interface {
+	Collectors() []prometheus.Collector
+	Close() error
+}
+
 type Component struct {
-	opts               component.Options
-	args               Arguments
-	handler            loki.LogsReceiver
-	fanout             *loki.Fanout
-	mut                sync.RWMutex
-	registry           *prometheus.Registry
-	baseTarget         discovery.Target
-	collectors         []Collector
-	instanceKey        string
-	dbConnection       *sql.DB
-	healthErr          *atomic.String
-	openSQL            func(driverName, dataSourceName string) (*sql.DB, error)
-	logsReceiver       loki.LogsReceiver
-	exporterCollectors []prometheus.Collector
+	opts             component.Options
+	args             Arguments
+	handler          loki.LogsReceiver
+	fanout           *loki.Fanout
+	mut              sync.RWMutex
+	registry         *prometheus.Registry
+	baseTarget       discovery.Target
+	collectors       []Collector
+	instanceKey      string
+	dbConnection     *sql.DB
+	healthErr        *atomic.String
+	openSQL          func(driverName, dataSourceName string) (*sql.DB, error)
+	logsReceiver     loki.LogsReceiver
+	exporterRuntimes []postgresExporterRuntime
 }
 
 func New(opts component.Options, args Arguments) (*Component, error) {
@@ -373,16 +408,16 @@ func (c *Component) tryReconnect(ctx context.Context) error {
 	return nil
 }
 
-// cleanupExporterCollectors releases resources held by embedded exporter collectors.
+// cleanupExporterCollectors unregisters and releases embedded exporter collectors.
 // Callers must hold c.mut.
 func (c *Component) cleanupExporterCollectors() {
-	for _, col := range c.exporterCollectors {
-		if closable, ok := col.(interface{ CloseServers() }); ok {
-			closable.CloseServers()
+	for _, runtime := range c.exporterRuntimes {
+		for _, col := range runtime.Collectors() {
+			c.registry.Unregister(col)
 		}
-		c.registry.Unregister(col)
+		_ = runtime.Close()
 	}
-	c.exporterCollectors = nil
+	c.exporterRuntimes = nil
 }
 
 func (c *Component) connectAndStartCollectors(ctx context.Context) error {
@@ -456,46 +491,35 @@ func (c *Component) connectAndStartCollectors(ctx context.Context) error {
 		exporterArgs := exporter_postgres.Arguments(*c.args.PrometheusExporter)
 		dsn := string(c.args.DataSourceName)
 
-		e := pg_exporter.NewExporter(
-			[]string{dsn},
-			c.opts.Logger,
-			pg_exporter.DisableDefaultMetrics(exporterArgs.DisableDefaultMetrics),
-			pg_exporter.WithUserQueriesPath(exporterArgs.CustomQueriesConfigPath),
-			pg_exporter.DisableSettingsMetrics(exporterArgs.DisableSettingsMetrics),
-			pg_exporter.AutoDiscoverDatabases(true),
-			pg_exporter.ExcludeDatabases(c.args.ExcludeDatabases),
-			pg_exporter.WithMetricPrefix("pg"),
-		)
-		if err := c.registry.Register(e); err != nil {
-			return fmt.Errorf("failed to register prometheus_exporter: %w", err)
+		upstreamConfig := upstream_config.NewConfigWithDefaults()
+		upstreamConfig.DataSourceNames = []string{dsn}
+		upstreamConfig.MetricPrefix = "pg"
+		upstreamConfig.CollectionTimeout = 10 * time.Second
+		upstreamConfig.DisableDefaultMetrics = exporterArgs.DisableDefaultMetrics
+		upstreamConfig.AutoDiscoverDatabases = true
+		upstreamConfig.UserQueriesPath = exporterArgs.CustomQueriesConfigPath
+		upstreamConfig.ExcludeDatabases = c.args.ExcludeDatabases
+		upstreamConfig.Collectors = postgresExporterCollectorStates(exporterArgs.DisableSettingsMetrics, exporterArgs.EnabledCollectors)
+		upstreamConfig.PGStatStatements = postgresExporterStatStatementsConfig(exporterArgs.StatStatementFlags)
+		if err := upstreamConfig.Validate(); err != nil {
+			return fmt.Errorf("failed to validate prometheus_exporter config: %w", err)
 		}
-		c.exporterCollectors = append(c.exporterCollectors, e)
 
-		if !exporterArgs.DisableDefaultMetrics {
-			collectorOpts := []pg_collector.Option{pg_collector.WithCollectionTimeout("10s")}
-			if exporterArgs.StatStatementFlags != nil {
-				collectorOpts = append(collectorOpts, pg_collector.WithStatStatementsConfig(pg_collector.StatStatementsConfig{
-					IncludeQuery:     exporterArgs.StatStatementFlags.IncludeQuery,
-					QueryLength:      exporterArgs.StatStatementFlags.QueryLength,
-					Limit:            exporterArgs.StatStatementFlags.Limit,
-					ExcludeDatabases: exporterArgs.StatStatementFlags.ExcludeDatabases,
-					ExcludeUsers:     exporterArgs.StatStatementFlags.ExcludeUsers,
-				}))
-			}
-			col, err := pg_collector.NewPostgresCollector(
-				c.opts.Logger,
-				c.args.ExcludeDatabases,
-				dsn,
-				exporterArgs.EnabledCollectors,
-				collectorOpts...,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to create postgres collector: %w", err)
-			}
+		runtime, err := collectors.NewRuntime(&upstreamConfig, c.opts.Logger)
+		if err != nil {
+			return fmt.Errorf("failed to create prometheus_exporter runtime: %w", err)
+		}
+		runtimeTracked := false
+		for _, col := range runtime.Collectors() {
 			if err := c.registry.Register(col); err != nil {
-				return fmt.Errorf("failed to register postgres collector: %w", err)
+				return fmt.Errorf("failed to register prometheus_exporter collector: %w", err)
 			}
-			c.exporterCollectors = append(c.exporterCollectors, col)
+			if !runtimeTracked {
+				// Keep the runtime tracked as soon as any collector is registered,
+				// so a later cleanup can unregister and close partial setup.
+				c.exporterRuntimes = append(c.exporterRuntimes, runtime)
+				runtimeTracked = true
+			}
 		}
 	}
 

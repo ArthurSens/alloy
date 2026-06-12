@@ -10,6 +10,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/grafana/loki/pkg/push"
+	upstream_config "github.com/prometheus-community/postgres_exporter/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
@@ -925,59 +926,44 @@ func Test_connectAndStartCollectors(t *testing.T) {
 	})
 }
 
-type fakeClosableCollector struct {
-	prometheus.Collector
+type fakeExporterRuntime struct {
+	collectors []prometheus.Collector
 	closeCalls int
 }
 
-func newFakeClosableCollector(name string) *fakeClosableCollector {
-	gauge := prometheus.NewGauge(prometheus.GaugeOpts{
+func newFakeExporterRuntime(name string) *fakeExporterRuntime {
+	collector := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: name,
 		Help: name,
 	})
-	return &fakeClosableCollector{Collector: gauge}
+	return &fakeExporterRuntime{collectors: []prometheus.Collector{collector}}
 }
 
-func (c *fakeClosableCollector) CloseServers() {
-	c.closeCalls++
+func (r *fakeExporterRuntime) Collectors() []prometheus.Collector {
+	return r.collectors
+}
+
+func (r *fakeExporterRuntime) Close() error {
+	r.closeCalls++
+	return nil
 }
 
 func TestComponent_cleanupExporterCollectors(t *testing.T) {
-	t.Run("closes closable exporters and unregisters them", func(t *testing.T) {
+	t.Run("closes runtimes and unregisters their collectors", func(t *testing.T) {
 		registry := prometheus.NewRegistry()
-		collector := newFakeClosableCollector("test_cleanup_exporter_collectors_closable")
-		require.NoError(t, registry.Register(collector))
+		runtime := newFakeExporterRuntime("test_cleanup_exporter_collectors_runtime")
+		require.NoError(t, registry.Register(runtime.collectors[0]))
 
 		c := &Component{
-			registry:           registry,
-			exporterCollectors: []prometheus.Collector{collector},
+			registry:         registry,
+			exporterRuntimes: []postgresExporterRuntime{runtime},
 		}
 
 		c.cleanupExporterCollectors()
 
-		assert.Equal(t, 1, collector.closeCalls)
-		assert.Nil(t, c.exporterCollectors)
-		assert.False(t, registry.Unregister(collector))
-	})
-
-	t.Run("unregisters non-closable collectors without panicking", func(t *testing.T) {
-		registry := prometheus.NewRegistry()
-		collector := prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "test_cleanup_exporter_collectors_plain",
-			Help: "test",
-		})
-		collector.Set(1)
-		require.NoError(t, registry.Register(collector))
-
-		c := &Component{
-			registry:           registry,
-			exporterCollectors: []prometheus.Collector{collector},
-		}
-
-		c.cleanupExporterCollectors()
-
-		assert.Nil(t, c.exporterCollectors)
-		assert.False(t, registry.Unregister(collector))
+		assert.Equal(t, 1, runtime.closeCalls)
+		assert.Nil(t, c.exporterRuntimes)
+		assert.False(t, registry.Unregister(runtime.collectors[0]))
 	})
 }
 
@@ -1041,9 +1027,9 @@ func TestPostgres_Reconnection(t *testing.T) {
 
 	t.Run("Run exits on context cancellation", func(t *testing.T) {
 		c := newTestComponent(t, func(_, _ string) (*sql.DB, error) { return nil, assert.AnError })
-		oldCollector := newFakeClosableCollector("test_run_cleanup_old_exporter")
-		require.NoError(t, c.registry.Register(oldCollector))
-		c.exporterCollectors = []prometheus.Collector{oldCollector}
+		runtime := newFakeExporterRuntime("test_run_cleanup_old_exporter")
+		require.NoError(t, c.registry.Register(runtime.collectors[0]))
+		c.exporterRuntimes = []postgresExporterRuntime{runtime}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -1051,9 +1037,9 @@ func TestPostgres_Reconnection(t *testing.T) {
 		err := c.Run(ctx)
 		assert.NoError(t, err)
 
-		assert.Equal(t, 1, oldCollector.closeCalls)
-		assert.Nil(t, c.exporterCollectors)
-		assert.False(t, c.registry.Unregister(oldCollector))
+		assert.Equal(t, 1, runtime.closeCalls)
+		assert.Nil(t, c.exporterRuntimes)
+		assert.False(t, c.registry.Unregister(runtime.collectors[0]))
 	})
 }
 
@@ -1110,5 +1096,28 @@ func Test_PrometheusExporterBlock(t *testing.T) {
 		var args Arguments
 		err := syntax.Unmarshal([]byte(cfg), &args)
 		require.ErrorContains(t, err, "prometheus_exporter and targets are mutually exclusive")
+	})
+
+	t.Run("collector states enable additional collectors", func(t *testing.T) {
+		states := postgresExporterCollectorStates(false, []string{upstream_config.CollectorStatStatements})
+
+		assert.True(t, states[upstream_config.CollectorDatabase])
+		assert.True(t, states[upstream_config.CollectorStatStatements])
+	})
+
+	t.Run("collector states disable settings collector", func(t *testing.T) {
+		states := postgresExporterCollectorStates(true, nil)
+
+		assert.False(t, states[upstream_config.CollectorSettings])
+	})
+
+	t.Run("stat statement flags keep upstream defaults when omitted", func(t *testing.T) {
+		cfg := postgresExporterStatStatementsConfig(&exporter_postgres.StatStatementFlags{
+			IncludeQuery: true,
+		})
+
+		assert.True(t, cfg.IncludeQuery)
+		assert.Equal(t, upstream_config.DefaultPGStatStatementsQueryLength, cfg.QueryLength)
+		assert.Equal(t, upstream_config.DefaultPGStatStatementsLimit, cfg.Limit)
 	})
 }

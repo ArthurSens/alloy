@@ -7,10 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
-	"github.com/prometheus-community/postgres_exporter/collector"
-	postgres_exporter "github.com/prometheus-community/postgres_exporter/exporter"
+	"github.com/prometheus-community/postgres_exporter/collectors"
+	upstream_config "github.com/prometheus-community/postgres_exporter/config"
 	config_util "github.com/prometheus/common/config"
 
 	"github.com/grafana/alloy/internal/static/integrations"
@@ -151,6 +152,37 @@ func (c *Config) getDataSourceNames() ([]string, error) {
 	return stringDsn, nil
 }
 
+func (c *Config) upstreamConfig(dsns []string) upstream_config.Config {
+	cfg := upstream_config.NewConfigWithDefaults()
+	cfg.DataSourceNames = dsns
+	cfg.MetricPrefix = "pg"
+	cfg.CollectionTimeout = 10 * time.Second
+	cfg.DisableDefaultMetrics = c.DisableDefaultMetrics
+	cfg.AutoDiscoverDatabases = c.AutodiscoverDatabases
+	cfg.UserQueriesPath = c.QueryPath
+	cfg.ExcludeDatabases = c.ExcludeDatabases
+	cfg.IncludeDatabases = c.IncludeDatabases
+	cfg.Collectors = upstream_config.DefaultCollectorConfig()
+	if c.DisableSettingsMetrics {
+		cfg.Collectors[upstream_config.CollectorSettings] = false
+	}
+	for _, collectorName := range c.EnabledCollectors {
+		cfg.Collectors[collectorName] = true
+	}
+	if c.StatStatementFlags != nil {
+		cfg.PGStatStatements.IncludeQuery = c.StatStatementFlags.IncludeQuery
+		if c.StatStatementFlags.QueryLength != 0 {
+			cfg.PGStatStatements.QueryLength = c.StatStatementFlags.QueryLength
+		}
+		if c.StatStatementFlags.Limit != 0 {
+			cfg.PGStatStatements.Limit = c.StatStatementFlags.Limit
+		}
+		cfg.PGStatStatements.ExcludeDatabases = c.StatStatementFlags.ExcludeDatabases
+		cfg.PGStatStatements.ExcludeUsers = c.StatStatementFlags.ExcludeUsers
+	}
+	return cfg
+}
+
 func init() {
 	integrations.RegisterIntegration(&Config{})
 	integrations_v2.RegisterLegacy(&Config{}, integrations_v2.TypeMultiplex, metricsutils.NewNamedShim("postgres"))
@@ -164,65 +196,24 @@ func New(logger *slog.Logger, cfg *Config) (integrations.Integration, error) {
 		return nil, err
 	}
 
-	e := postgres_exporter.NewExporter(
-		dsns,
-		logger,
-		postgres_exporter.DisableDefaultMetrics(cfg.DisableDefaultMetrics),
-		postgres_exporter.WithUserQueriesPath(cfg.QueryPath),
-		postgres_exporter.DisableSettingsMetrics(cfg.DisableSettingsMetrics),
-		postgres_exporter.AutoDiscoverDatabases(cfg.AutodiscoverDatabases),
-		postgres_exporter.ExcludeDatabases(cfg.ExcludeDatabases),
-		postgres_exporter.IncludeDatabases(strings.Join(cfg.IncludeDatabases, ",")),
-		postgres_exporter.WithMetricPrefix("pg"),
-	)
+	upstreamConfig := cfg.upstreamConfig(dsns)
+	if err := upstreamConfig.Validate(); err != nil {
+		return nil, err
+	}
+
+	runtime, err := collectors.NewRuntime(&upstreamConfig, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create postgres_exporter runtime: %w", err)
+	}
 
 	run := func(ctx context.Context) error {
 		<-ctx.Done()
-		e.CloseServers()
-		return nil
-	}
-
-	if cfg.DisableDefaultMetrics {
-		// Don't include the collector metrics if the default metrics are disabled.
-		return integrations.NewCollectorIntegration(
-			cfg.Name(),
-			integrations.WithCollectors(e),
-			integrations.WithRunner(run),
-		), nil
-	}
-
-	// Build per-instance collector options.
-	collectorOpts := []collector.Option{
-		collector.WithCollectionTimeout("10s"),
-	}
-	if cfg.StatStatementFlags != nil {
-		collectorOpts = append(collectorOpts, collector.WithStatStatementsConfig(collector.StatStatementsConfig{
-			IncludeQuery:     cfg.StatStatementFlags.IncludeQuery,
-			QueryLength:      cfg.StatStatementFlags.QueryLength,
-			Limit:            cfg.StatStatementFlags.Limit,
-			ExcludeDatabases: cfg.StatStatementFlags.ExcludeDatabases,
-			ExcludeUsers:     cfg.StatStatementFlags.ExcludeUsers,
-		}))
-	}
-
-	// On top of the exporter's metrics, the postgres exporter also has metrics exposed via collector package.
-	// However, these can only work for the first DSN provided. This matches the current implementation of the exporter.
-	// TODO: Once https://github.com/prometheus-community/postgres_exporter/issues/999 is addressed, update the exporter
-	// and change this.
-	c, err := collector.NewPostgresCollector(
-		logger,
-		cfg.ExcludeDatabases,
-		dsns[0],
-		cfg.EnabledCollectors,
-		collectorOpts...,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create postgres_exporter collector: %w", err)
+		return runtime.Close()
 	}
 
 	return integrations.NewCollectorIntegration(
 		cfg.Name(),
-		integrations.WithCollectors(e, c),
+		integrations.WithCollectors(runtime.Collectors()...),
 		integrations.WithRunner(run),
 	), nil
 }

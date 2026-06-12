@@ -2,7 +2,10 @@ package postgres_exporter
 
 import (
 	"testing"
+	"time"
 
+	upstream_config "github.com/prometheus-community/postgres_exporter/config"
+	config_util "github.com/prometheus/common/config"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 )
@@ -87,4 +90,50 @@ func Test_getDataSourceNames(t *testing.T) {
 			require.Equal(t, tc.expect, res)
 		})
 	}
+}
+
+func Test_upstreamConfig(t *testing.T) {
+	cfg := Config{
+		DataSourceNames:        []config_util.Secret{"postgresql://localhost:5432/postgres?sslmode=disable"},
+		DisableSettingsMetrics: true,
+		AutodiscoverDatabases:  true,
+		ExcludeDatabases:       []string{"rdsadmin"},
+		IncludeDatabases:       []string{"postgres"},
+		DisableDefaultMetrics:  true,
+		QueryPath:              "/tmp/queries.yaml",
+		EnabledCollectors:      []string{upstream_config.CollectorStatStatements, upstream_config.CollectorStatCheckpointer},
+		StatStatementFlags: &StatStatementFlags{
+			IncludeQuery:     true,
+			QueryLength:      200,
+			Limit:            50,
+			ExcludeDatabases: []string{"template0"},
+			ExcludeUsers:     []string{"postgres"},
+		},
+	}
+
+	dsns, err := cfg.getDataSourceNames()
+	require.NoError(t, err)
+
+	actual := cfg.upstreamConfig(dsns)
+	require.Equal(t, []string{"postgresql://localhost:5432/postgres?sslmode=disable"}, actual.DataSourceNames)
+	require.Equal(t, "pg", actual.MetricPrefix)
+	require.Equal(t, 10*time.Second, actual.CollectionTimeout)
+	require.True(t, actual.AutoDiscoverDatabases)
+	require.True(t, actual.DisableDefaultMetrics)
+	require.Equal(t, "/tmp/queries.yaml", actual.UserQueriesPath)
+	require.Equal(t, []string{"rdsadmin"}, actual.ExcludeDatabases)
+	require.Equal(t, []string{"postgres"}, actual.IncludeDatabases)
+	require.True(t, actual.Collectors[upstream_config.CollectorStatStatements])
+	require.True(t, actual.Collectors[upstream_config.CollectorStatCheckpointer])
+	require.True(t, actual.Collectors[upstream_config.CollectorDatabase])
+	require.False(t, actual.Collectors[upstream_config.CollectorSettings])
+	require.Equal(t, upstream_config.PGStatStatementsConfig{
+		IncludeQuery:     true,
+		QueryLength:      200,
+		Limit:            50,
+		ExcludeDatabases: []string{"template0"},
+		ExcludeUsers:     []string{"postgres"},
+	}, actual.PGStatStatements)
+
+	require.NoError(t, actual.Validate())
 }
